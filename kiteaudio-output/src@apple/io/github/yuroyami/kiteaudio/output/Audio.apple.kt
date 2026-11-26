@@ -34,10 +34,14 @@ import platform.CoreAudioTypes.kAudioFormatFlagIsPacked
 import platform.CoreAudioTypes.kAudioFormatFlagIsSignedInteger
 import platform.CoreAudioTypes.kAudioFormatLinearPCM
 import platform.CoreAudioTypes.kAudioTimeStampSampleTimeValid
+import platform.darwin.DISPATCH_TIME_NOW
+import platform.darwin.dispatch_after
 import platform.darwin.dispatch_async
 import platform.darwin.dispatch_queue_create
 import platform.darwin.dispatch_sync
+import platform.darwin.dispatch_time
 import platform.posix.memcpy
+import platform.posix.memset
 
 // Detect only our own user-callback reentrancy, without a lock or heap allocation per block.
 @ThreadLocal
@@ -50,6 +54,9 @@ private var callbackOutput: AppleAudioOutput? = null
  *
  * The system can end a stream: the queue stops running, or [watchSession] reports a notice of
  * the audio session. Both hop to the control queue, which sends DeviceLost, then Stopped.
+ *
+ * A stop by the app fades out on the render queue. The callbacks after the fade enqueue silence
+ * until the buffer that holds the end of the fade comes back, then the control queue releases.
  */
 internal class AppleAudioOutput(
     override val format: AudioFormat,
@@ -67,9 +74,11 @@ internal class AppleAudioOutput(
     override val deviceFormat: AudioFormat?
         get() = try { readDeviceFormat() } catch (_: Throwable) { null }
 
-    private class Generation(samples: Int, callback: AudioRenderCallback) {
+    private class Generation(samples: Int, channels: Int, sampleRate: Int, callback: AudioRenderCallback) {
         val active = AtomicBoolean(true)
         val started = AtomicBoolean(false)
+        /** True once the app stopped the stream and its sound fades out. */
+        val fading = AtomicBoolean(false)
         val released = AtomicBoolean(false)
         val disposalFailureReported = AtomicBoolean(false)
         val scratch = FloatArray(samples)
@@ -82,6 +91,14 @@ internal class AppleAudioOutput(
         val clock = nativeHeap.alloc<AudioTimeStamp>()
         var enqueuedFrames = 0L
         var dry = false
+        val fade = StopFade(sampleRate, channels)
+        /** True once the buffer with the end of the fade is enqueued. */
+        var fadeDone = false
+        /** The callbacks since [fadeDone]. */
+        var silentCallbacks = 0
+
+        /** True while the stream plays and the app has not stopped it. */
+        val playing: Boolean get() = active.load() && !fading.load()
 
         // Only the control queue reads or writes the fields below.
         var listener: StableRef<RunningWatch>? = null
@@ -110,23 +127,23 @@ internal class AppleAudioOutput(
     /** The listener StableRefs that this output holds now. Tests check it for leaks. */
     internal val openListenerRefs: Int get() = listenerRefs.load()
     override val isRunning: Boolean
-        get() = generation.load()?.let { it.active.load() && it.started.load() } == true
+        get() = generation.load()?.let { it.playing && it.started.load() } == true
 
     override fun start(callback: AudioRenderCallback) {
         check(!closed.load()) { "the audio output is closed" }
         if (callbackOutput === this) {
-            if (generation.load()?.active?.load() == true) return
+            if (generation.load()?.playing == true) return
             error("the previous audio callback is still stopping")
         }
         val current = generation.load()
-        if (current?.active?.load() == true) return
+        if (current?.playing == true) return
         check(current == null) { "the previous audio callback is still stopping" }
         check(startPending.compareAndSet(false, true)) { "an audio start is already in progress" }
         try {
             // Recheck after claiming startup so a concurrent stop never leaves this call
             // queued behind teardown waiting for an arbitrary application callback.
             val latest = generation.load()
-            if (latest?.active?.load() == true) return
+            if (latest?.playing == true) return
             check(latest == null) { "the previous audio callback is still stopping" }
             // Throw Kotlin errors after dispatch returns, never through an ObjC block.
             var failure: Throwable? = null
@@ -142,9 +159,9 @@ internal class AppleAudioOutput(
     private fun startOnControlQueue(callback: AudioRenderCallback) {
         check(!closed.load()) { "the audio output is closed" }
         val previous = generation.load()
-        if (previous?.active?.load() == true) return
+        if (previous?.playing == true) return
         check(previous == null) { "the previous audio callback is still stopping" }
-        val next = Generation(bufferFrames * format.channels, callback)
+        val next = Generation(bufferFrames * format.channels, format.channels, format.sampleRate, callback)
         next.observer = { event ->
             if (event is AudioOutputEvent.Failed) next.active.store(false)
             deliverAudioEvent(onEvent, event)
@@ -229,7 +246,7 @@ internal class AppleAudioOutput(
             next.started.store(true)
             dispatch_async(renderQueue) {
                 inCallback {
-                    if (next.active.load()) deliverAudioEvent(onEvent, AudioOutputEvent.Started(format, latency))
+                    if (next.playing) deliverAudioEvent(onEvent, AudioOutputEvent.Started(format, latency))
                 }
             }
         } catch (problem: Throwable) {
@@ -246,6 +263,10 @@ internal class AppleAudioOutput(
 
     private fun fill(current: Generation, queue: AudioQueueRef?, buffer: AudioQueueBufferRef?) {
         if (!current.active.load() || queue == null || buffer == null) return
+        if (current.fadeDone) {
+            playOut(current, queue, buffer)
+            return
+        }
         val callback = current.callback ?: return
         val filled = renderAudioBlock(callback, current.scratch, bufferFrames, format.framesToMicros(bufferFrames), current.observer)
         if (filled == RENDER_FAILED) {
@@ -255,6 +276,9 @@ internal class AppleAudioOutput(
         }
         // User callbacks may have stopped/closed us. Disposal waits for this entire block.
         if (!current.active.load()) return
+        // A stop by the app, also one from inside this render, fades this block and the next ones out.
+        val fading = current.fading.load()
+        if (fading && current.fade.apply(current.scratch, bufferFrames)) current.fadeDone = true
         for (i in current.scratch.indices) {
             current.pcm[i] = (current.scratch[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
         }
@@ -272,12 +296,43 @@ internal class AppleAudioOutput(
         if (status == 0) {
             // Read the clock only after a good enqueue, so a slow call never delays the checks of a refused buffer.
             // A short render already sent Underrun, so its block counts no device underrun.
-            if (queueRanDry(current, queue) && filled == bufferFrames) deviceUnderruns.report(1, onEvent)
+            // The fade and its play-out count nothing.
+            if (!fading && queueRanDry(current, queue) && filled == bufferFrames) deviceUnderruns.report(1, onEvent)
             current.enqueuedFrames += bufferFrames
             return
         }
+        refused(current, queue, status)
+    }
+
+    /**
+     * Enqueues silence after the fade. The buffer with the end of the fade comes back
+     * [BUFFER_COUNT] callbacks after it was enqueued, and then the stream is released.
+     */
+    private fun playOut(current: Generation, queue: AudioQueueRef, buffer: AudioQueueBufferRef) {
+        if (++current.silentCallbacks >= BUFFER_COUNT) {
+            if (current.active.compareAndSet(true, false)) requestRelease(current)
+            return
+        }
+        val destination = buffer.pointed.mAudioData
+        if (destination == null) {
+            fail(current, "AudioQueue returned a buffer without sample storage")
+            return
+        }
+        memset(destination, 0, (current.pcm.size * 2).convert())
+        buffer.pointed.mAudioDataByteSize = (current.pcm.size * 2).toUInt()
+        val status = driver.enqueue(queue, buffer)
+        if (status != 0) refused(current, queue, status)
+    }
+
+    /** Handles a buffer that the queue refused with [status]. */
+    private fun refused(current: Generation, queue: AudioQueueRef, status: Int) {
         // A stream that the app or the system already ended expects its buffers to be refused.
         if (!current.active.load()) return
+        // The app already stopped a stream in its fade, so a refused buffer only ends the release early.
+        if (current.fading.load()) {
+            if (current.active.compareAndSet(true, false)) requestRelease(current)
+            return
+        }
         // A queue that the system stopped hands its buffers back and refuses them. That is a loss.
         if (current.started.load() && driver.isRunning(queue) != true) {
             dispatch_async(controlQueue) { queueRunningChanged(current) }
@@ -342,14 +397,16 @@ internal class AppleAudioOutput(
         dispatch_sync(controlQueue) { }
     }
 
-    // Runs on the control queue. A stream the app stopped already sends no DeviceLost.
+    // Runs on the control queue. A stream the app stopped already sends no DeviceLost, also during its fade.
     private fun endBySystem(current: Generation, reason: String, invalidatesQueue: Boolean) {
         if (generation.load() !== current || current.released.load()) return
         if (invalidatesQueue) current.queueInvalid = true
         if (current.started.load() && current.active.compareAndSet(true, false)) {
             current.started.store(false)
             // The render queue is serial, so DeviceLost arrives before the Stopped of the release.
-            dispatch_async(renderQueue) { inCallback { deliverAudioEvent(onEvent, AudioOutputEvent.DeviceLost(reason)) } }
+            if (!current.fading.load()) {
+                dispatch_async(renderQueue) { inCallback { deliverAudioEvent(onEvent, AudioOutputEvent.DeviceLost(reason)) } }
+            }
             releaseOnControlQueue(current)
         } else if (invalidatesQueue && !current.active.load()) {
             // A queue whose disposal failed may be invalid now. Retry, so a restart is possible.
@@ -425,14 +482,40 @@ internal class AppleAudioOutput(
 
     override fun stop() {
         val current = generation.load() ?: return
+        // A stream that plays fades out. One that has not started yet has nothing to fade.
+        if (current.started.load() && current.active.load()) {
+            if (current.fading.compareAndSet(false, true)) forceReleaseLater(current)
+            return
+        }
+        cancel(current)
+    }
+
+    override fun close() {
+        closed.store(true)
+        generation.load()?.let(::cancel)
+    }
+
+    /** Ends [current] at once, with no fade. */
+    private fun cancel(current: Generation) {
         current.active.store(false)
         current.started.store(false)
         requestRelease(current)
     }
 
-    override fun close() {
-        closed.store(true)
-        stop()
+    /**
+     * Releases [current] on the control queue if its fade has not ended by then, for a queue that
+     * stopped asking for buffers. The wait is twice the latency and the fade, plus 100 ms.
+     */
+    private fun forceReleaseLater(current: Generation) {
+        val frames = 2L * (bufferFrames.toLong() * BUFFER_COUNT + current.fade.frames)
+        val nanos = frames * 1_000_000_000L / format.sampleRate + 100_000_000L
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, nanos), controlQueue) {
+            if (generation.load() === current && !current.released.load()) {
+                current.active.store(false)
+                current.started.store(false)
+                releaseOnControlQueue(current)
+            }
+        }
     }
 
     private companion object {

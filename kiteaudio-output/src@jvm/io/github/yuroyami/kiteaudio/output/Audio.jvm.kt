@@ -24,6 +24,8 @@ internal class JvmAudioOutput(
 
     private class Generation {
         @Volatile var active: Boolean = false
+        /** True once the app stopped the stream and its sound fades out. */
+        @Volatile var fading: Boolean = false
         lateinit var worker: Thread
     }
 
@@ -32,7 +34,7 @@ internal class JvmAudioOutput(
     // Only the worker thread uses it, and one worker ends before the next one starts.
     private val deviceUnderruns = DeviceUnderrunCounter()
     private var closed = false
-    override val isRunning: Boolean get() = generation?.active == true
+    override val isRunning: Boolean get() = generation?.let { it.active && !it.fading } == true
 
     override fun start(callback: AudioRenderCallback) {
         var failure: Throwable? = null
@@ -40,7 +42,7 @@ internal class JvmAudioOutput(
         synchronized(stateLock) {
             check(!closed) { "the audio output is closed" }
             val previous = generation
-            if (previous?.active == true) return
+            if (previous != null && previous.active && !previous.fading) return
             check(previous == null) { "the previous audio callback is still stopping" }
             val next = Generation()
             next.worker = Thread({ pump(next, callback) }, "KiteAudio-output-jvm").apply {
@@ -69,18 +71,24 @@ internal class JvmAudioOutput(
         try {
             val floats = FloatArray(bufferFrames * format.channels)
             val pcm = ByteArray(floats.size * 2)
+            val fade = StopFade(format.sampleRate, format.channels)
             val observer: (AudioOutputEvent) -> Unit = { event ->
                 if (event is AudioOutputEvent.Failed) current.active = false
                 deliverAudioEvent(onEvent, event)
             }
-            if (current.active) deliverAudioEvent(onEvent, AudioOutputEvent.Started(format, latency))
+            if (current.active && !current.fading) deliverAudioEvent(onEvent, AudioOutputEvent.Started(format, latency))
             val lineBytes = line.bufferSize
             // The bytes this stream has written. The line starts empty, so it is checked only once it was full.
             var streamBytes = 0L
             while (current.active) {
+                // A stop before the first block leaves nothing to fade.
+                if (current.fading && streamBytes == 0L) break
                 val filled = renderAudioBlock(callback, floats, bufferFrames, format.framesToMicros(bufferFrames), observer)
                 if (filled == RENDER_FAILED) break
                 if (!current.active) break
+                // A stop by the app, also one from inside this render, fades this block and the next ones out.
+                val fading = current.fading
+                val fadeEnded = fading && fade.apply(floats, bufferFrames)
                 var offset = 0
                 for (sample in floats) {
                     val value = (sample.coerceIn(-1f, 1f) * 32767f).toInt()
@@ -89,31 +97,14 @@ internal class JvmAudioOutput(
                 }
                 // Java Sound has no underrun counter. A line with no bytes left to play has run dry.
                 // A short render already sent Underrun, so its block counts no device underrun.
-                val ranDry = streamBytes >= lineBytes && filled == bufferFrames && line.available() >= lineBytes
-                var written = 0
-                var noProgress = 0
-                while (current.active && written < pcm.size) {
-                    val count = line.write(pcm, written, pcm.size - written)
-                    if (!current.active) break
-                    if (count < 0 || count > pcm.size - written || count % (format.channels * 2) != 0) {
-                        current.active = false
-                        deliverAudioEvent(onEvent, AudioOutputEvent.DeviceLost("SourceDataLine.write returned invalid count $count"))
-                        break
-                    }
-                    if (count == 0) {
-                        if (++noProgress >= 10) {
-                            current.active = false
-                            deliverAudioEvent(onEvent, AudioOutputEvent.DeviceLost("SourceDataLine.write made no progress"))
-                        } else {
-                            Thread.sleep(1)
-                        }
-                    } else {
-                        written += count
-                        noProgress = 0
-                    }
-                }
-                streamBytes += written
+                // The fade and its play-out count nothing.
+                val ranDry = !fading && streamBytes >= lineBytes && filled == bufferFrames && line.available() >= lineBytes
+                streamBytes += write(current, pcm)
                 if (ranDry && current.active) deviceUnderruns.report(1, onEvent)
+                if (fadeEnded) {
+                    playOut(current, pcm)
+                    break
+                }
             }
         } catch (problem: Throwable) {
             current.active = false
@@ -129,30 +120,82 @@ internal class JvmAudioOutput(
         }
     }
 
+    /** Writes all of [pcm] and returns the bytes written. A stream that ends stops the write early. */
+    private fun write(current: Generation, pcm: ByteArray): Int {
+        var written = 0
+        var noProgress = 0
+        while (current.active && written < pcm.size) {
+            val count = line.write(pcm, written, pcm.size - written)
+            if (!current.active) break
+            if (count < 0 || count > pcm.size - written || count % (format.channels * 2) != 0) {
+                lose(current, "SourceDataLine.write returned invalid count $count")
+                break
+            }
+            if (count == 0) {
+                if (++noProgress >= 10) lose(current, "SourceDataLine.write made no progress") else Thread.sleep(1)
+            } else {
+                written += count
+                noProgress = 0
+            }
+        }
+        return written
+    }
+
+    /** Ends the stream for a write that failed. A stream in its fade sends no DeviceLost, because the app stopped it. */
+    private fun lose(current: Generation, reason: String) {
+        current.active = false
+        if (!current.fading) deliverAudioEvent(onEvent, AudioOutputEvent.DeviceLost(reason))
+    }
+
+    /**
+     * Writes silence for the whole line after the last block of the fade. A write returns only
+     * once the line has room, so the faded block has played when the last one returns.
+     */
+    private fun playOut(current: Generation, pcm: ByteArray) {
+        pcm.fill(0)
+        var frames = line.bufferSize / (format.channels * 2)
+        while (frames > 0 && current.active) {
+            write(current, pcm)
+            frames -= bufferFrames
+        }
+    }
+
     private fun haltOutput() {
         runCatching { line.stop() }
         runCatching { line.flush() }
     }
 
     override fun stop() {
-        val current = synchronized(stateLock) {
-            generation?.also {
-                it.active = false
-                // Unblock a platform write before waiting for the worker.
+        val current = synchronized(stateLock) { generation?.also { it.fading = true } } ?: return
+        // A call from the worker returns at once, and the worker goes on with the fade.
+        if (Thread.currentThread() === current.worker) return
+        try { current.worker.join(500) } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        // A line that stopped taking sound, or a renderer that blocks, halts at once and unblocks the write.
+        if (current.worker.isAlive) synchronized(stateLock) {
+            if (generation === current) {
+                current.active = false
                 haltOutput()
-            }
-        } ?: return
-        if (Thread.currentThread() !== current.worker) {
-            try { current.worker.join(500) } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
             }
         }
         // The worker retains ownership until finally, even after the bounded wait expires.
     }
 
     override fun close() {
-        synchronized(stateLock) { closed = true }
-        stop()
+        val current = synchronized(stateLock) {
+            closed = true
+            generation?.also {
+                it.active = false
+                // Unblock a platform write before waiting for the worker.
+                haltOutput()
+            }
+        }
+        if (current != null && Thread.currentThread() !== current.worker) {
+            try { current.worker.join(500) } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
         synchronized(stateLock) { runCatching { line.close() } }
     }
 }

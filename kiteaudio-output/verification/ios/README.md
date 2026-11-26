@@ -6,7 +6,7 @@ An iPhone app for what the macOS tests cannot check: how the output ends a strea
 
 On iOS the output ends a running stream with `DeviceLost` and then `Stopped` in these cases:
 
-- An interruption of the audio session begins, for example Siri, an alarm or a phone call.
+- An interruption of the audio session begins, for example an alarm, a timer or a phone call.
 - A route change removes the output device, for example headphones that you disconnect.
 - The system stops the AudioQueue of the stream.
 
@@ -83,8 +83,8 @@ Start and stop:
 
 An interruption:
 
-5. Hold the side button until Siri starts. Check: the log shows `session: interruption began`, then `event DeviceLost` and `event Stopped`. `isRunning` is false and the tone stops.
-6. Close Siri. Check: the log shows `session: interruption ended`, and the tone stays off.
+5. Ask Siri to set a timer for 15 seconds, then close Siri. Check: the tone plays on. Siri only lowers the volume for a moment, and that is not an interruption.
+6. Wait for the timer. Check: when it rings, the log shows `session: interruption began`, then `event DeviceLost` and `event Stopped`. `isRunning` is false and the tone stops. Then stop the timer on its banner. Check: the log shows `session: interruption ended`, and the tone stays off.
 7. Tap Start. Check: the tone plays and the log shows `event Started`.
 
 A lost route:

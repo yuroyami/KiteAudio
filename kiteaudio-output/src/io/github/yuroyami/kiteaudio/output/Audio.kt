@@ -166,18 +166,32 @@ public interface AudioOutput {
     public fun start(callback: AudioRenderCallback)
 
     /**
-     * Cancels the current render generation. In-progress rendering, writes, or event delivery
-     * may finish after this returns. Restart is rejected until that generation has unwound.
-     * JVM/Android wait up to 500 ms after unblocking output; Apple schedules teardown. The web
-     * stops at once, or when a render in progress returns if called from the renderer.
-     * A call from the renderer never waits for itself. Safe when already stopped.
+     * Fades the sound out and ends the current render generation.
+     *
+     * [isRunning] is false when this function returns. The render callback is still called for
+     * the blocks of the fade. The fade multiplies the rendered sound by a gain that falls from 1
+     * to 0 over 5 ms, and the rest of its last block is silence. The output then plays out the
+     * sound that is still queued, halts and sends [AudioOutputEvent.Stopped] once. A stream that
+     * has not started yet ends at once, with no fade.
+     *
+     * The fade is bounded. JVM and Android wait up to 500 ms for it, then halt at once. Apple
+     * halts at once when the queue stops asking for buffers, after about twice the latency plus
+     * 100 ms. The web does the same through a timer of the page.
+     *
+     * A system end during the fade sends no [AudioOutputEvent.DeviceLost], because the app
+     * already stopped the stream. A render failure during the fade ends it at once with
+     * [AudioOutputEvent.Failed]. A [start] during the fade throws [IllegalStateException], as it
+     * does until the generation has unwound.
+     *
+     * Safe from any thread, also from the render callback or an event observer. A call from the
+     * renderer never waits for itself. Safe when already stopped.
      */
     public fun stop()
 
     /**
-     * Permanently closes this output and cancels rendering immediately. Resource cleanup and
-     * application callbacks already in progress may finish after this returns.
-     * Safe to call from a callback.
+     * Permanently closes this output and cancels rendering at once, with no fade. A close
+     * during the fade of a [stop] also ends it at once. Resource cleanup and application
+     * callbacks already in progress may finish after this returns. Safe to call from a callback.
      */
     public fun close()
 }
@@ -251,6 +265,50 @@ internal class DeviceUnderrunCounter {
         if (dropouts <= 0) return
         total += dropouts
         deliverAudioEvent(observer, AudioOutputEvent.DeviceUnderrun(dropouts, total))
+    }
+}
+
+/** The length of the fade-out of [AudioOutput.stop]. */
+internal const val STOP_FADE_MILLIS: Int = 5
+
+/**
+ * The fade-out of a stop by the app: a linear gain from 1 to 0 over [STOP_FADE_MILLIS].
+ *
+ * Only the thread or queue that renders the blocks uses it, so it needs no lock. It allocates
+ * nothing after it is made. A fade longer than one block goes on in the next call of [apply].
+ */
+internal class StopFade(sampleRate: Int, private val channels: Int) {
+    /** The length of the fade in frames, at least one. */
+    val frames: Int = maxOf(1, sampleRate * STOP_FADE_MILLIS / 1000)
+
+    /** The fade frames that [apply] has used so far. */
+    private var position = 0
+
+    /** True once the gain has reached zero. */
+    val finished: Boolean get() = position >= frames
+
+    /** Starts the fade again from a gain of 1. */
+    fun reset() { position = 0 }
+
+    /** The gain of fade frame [index]. The last fade frame and every frame after it are exactly 0. */
+    fun gain(index: Int): Float = if (index >= frames - 1) 0f else (frames - 1 - index).toFloat() / frames
+
+    /**
+     * Multiplies the first [count] interleaved frames of [out] by the gain, from where the last
+     * call ended. The frames after the end of the fade become 0.
+     *
+     * @return true when the fade has ended in this block or before it
+     */
+    fun apply(out: FloatArray, count: Int): Boolean {
+        var sample = 0
+        repeat(count) {
+            val g = if (position < frames) gain(position++) else 0f
+            repeat(channels) {
+                out[sample] = if (g == 0f) 0f else out[sample] * g
+                sample++
+            }
+        }
+        return finished
     }
 }
 

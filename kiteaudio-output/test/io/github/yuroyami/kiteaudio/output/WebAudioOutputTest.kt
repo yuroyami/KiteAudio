@@ -39,8 +39,18 @@ class WebAudioOutputTest {
         var newBlocks = 0
         var loads = 0
         var now = 0.0
-        var tick: (() -> Unit)? = null
+        /** Every timer that runs, with its interval and its tick, in the order they started. */
+        val timers = LinkedHashMap<Handle, Pair<Int, () -> Unit>>()
+        /** The oldest timer: the one that books scheduled buffers. */
+        val tick: (() -> Unit)? get() = timers.values.firstOrNull()?.second
+        /** The newest timer: the fallback of a stop. */
+        val lastTimer: Pair<Int, () -> Unit>? get() = timers.values.lastOrNull()
         var timersStopped = 0
+        /** The blocks posted to the worklet that it has not handed back yet, oldest first. */
+        val inFlight = ArrayDeque<Pair<Int, Handle>>()
+        /** A copy of the samples of every posted block, and of every scheduled buffer. */
+        val postedSamples = mutableListOf<FloatArray>()
+        val playedSamples = mutableListOf<FloatArray>()
         val gains = mutableListOf<Handle>()
         val disconnected = mutableListOf<Handle>()
         /** Every scheduled buffer: its start time and its first sample. */
@@ -55,9 +65,10 @@ class WebAudioOutputTest {
         override fun disconnect(node: Handle) { disconnected += node }
         override fun playBuffer(context: Handle, destination: Handle, channels: Int, frames: Int, block: Handle, at: Double) {
             played += at to block.samples[0]
+            playedSamples += block.samples.copyOf()
         }
-        override fun startTimer(intervalMs: Int, tick: () -> Unit): Handle { this.tick = tick; return Handle("timer") }
-        override fun stopTimer(timer: Handle) { timersStopped++; tick = null }
+        override fun startTimer(intervalMs: Int, tick: () -> Unit): Handle = Handle("timer").also { timers[it] = intervalMs to tick }
+        override fun stopTimer(timer: Handle) { timersStopped++; timers.remove(timer) }
         override fun newContext(sampleRate: Int) = Handle("context")
         override fun baseLatencySeconds(context: Handle) = 0.01
         override fun loadProcessor(context: Handle, source: String, done: () -> Unit, failed: (String) -> Unit) {
@@ -74,10 +85,20 @@ class WebAudioOutputTest {
             this.returned = returned
             processorFailed = failed
         }
-        override fun release(node: Handle) { released += node }
+        override fun release(node: Handle) { released += node; inFlight.clear() }
         override fun newBlock(samples: Int): Handle { newBlocks++; return Handle("block", FloatArray(samples)) }
         override fun fill(block: Handle, samples: FloatArray) { samples.copyInto(block.samples) }
-        override fun post(node: Handle, slot: Int, block: Handle) { posted += slot to block }
+        override fun post(node: Handle, slot: Int, block: Handle) {
+            posted += slot to block
+            inFlight.addLast(slot to block)
+            postedSamples += block.samples.copyOf()
+        }
+
+        /** Hands back the oldest block in flight, as the processor does, with [silence] frames played since the last one. */
+        fun handBackOldest(silence: Int = 0) {
+            val (slot, block) = inFlight.removeFirst()
+            returned!!(slot, silence, block)
+        }
 
         /** Loads the worklet and resumes the context, as a browser does once the page may play. */
         fun play() {
@@ -99,6 +120,19 @@ class WebAudioOutputTest {
 
     private fun open(bufferFrames: Int = 256, technique: BrowserTechnique = BrowserTechnique.Worklet) =
         openBrowserOutput(web, format, bufferFrames, technique) { events += it }
+
+    /**
+     * Plays out the fade of a stop until [events] gets one more Stopped: hands back the blocks in
+     * flight to the worklet, or moves the clock on and lets the timer book and play the buffers.
+     */
+    private fun FakeWebAudio.finishFade(events: List<AudioOutputEvent>, step: Double = 256.0 / 48_000) {
+        val stops = events.count { it == AudioOutputEvent.Stopped }
+        repeat(100) {
+            if (events.count { it == AudioOutputEvent.Stopped } > stops) return
+            if (inFlight.isNotEmpty()) handBackOldest() else { now += step; tick?.invoke() }
+        }
+        error("the fade did not end: $events")
+    }
 
     @Test
     fun startingBeforeTheWorkletLoadsWaitsThenFillsEveryBlock() {
@@ -132,23 +166,34 @@ class WebAudioOutputTest {
     }
 
     @Test
-    fun stoppingInsideTheRendererEndsWhenTheRenderReturns() {
+    fun stoppingInsideTheRendererFadesThatBlockAndEndsOnceItHasPlayed() {
         lateinit var output: AudioOutput
+        var restart: Throwable? = null
         output = open()
         output.start { out, frames ->
             rendered++
+            out.fill(0.5f)
             if (rendered == 2) {
                 output.stop()
-                assertTrue(AudioOutputEvent.Stopped !in events, "stopped inside the render")
+                assertTrue(!output.isRunning, "isRunning was true after stop returned")
+                restart = runCatching { output.start(counting) }.exceptionOrNull()
             }
-            out.fill(0f)
             frames
         }
         web.play()
 
-        assertEquals(AudioOutputEvent.Stopped, events.last())
+        assertIs<IllegalStateException>(restart, "a start during the fade was not rejected")
+        // A fade of 240 frames ends inside the block of 256 frames that called stop.
         assertEquals(2, rendered)
-        assertEquals(1, web.posted.size, "the block rendered after stop was still posted")
+        assertEquals(2, web.posted.size, "the faded block was not posted")
+        assertFaded(web.postedSamples[1].everyOther(), 0.5f, 256)
+        assertTrue(AudioOutputEvent.Stopped !in events, "stopped before the faded block played")
+
+        web.handBackOldest()
+        assertTrue(AudioOutputEvent.Stopped !in events, "stopped before the faded block played")
+        web.handBackOldest()
+        assertEquals(AudioOutputEvent.Stopped, events.last())
+        assertEquals(1, events.count { it == AudioOutputEvent.Stopped })
         assertEquals(web.nodes, web.released)
         assertEquals(1, web.suspends)
 
@@ -177,11 +222,13 @@ class WebAudioOutputTest {
         lateinit var output: AudioOutput
         var rejected: Throwable? = null
         output = openBrowserOutput(web, format, 256, BrowserTechnique.Worklet) { event ->
+            events += event
             if (event == AudioOutputEvent.Stopped) rejected = runCatching { output.start(counting) }.exceptionOrNull()
         }
         output.start(counting)
         web.play()
         output.stop()
+        web.finishFade(events)
 
         assertIs<IllegalStateException>(rejected)
         output.start(counting)
@@ -247,6 +294,7 @@ class WebAudioOutputTest {
 
         web.play()
         output.stop()
+        web.finishFade(events)
         val stopped = events.size
         web.stateChanged!!("suspended")
         assertEquals(stopped, events.size, "the output's own suspend was reported")
@@ -396,9 +444,13 @@ class WebAudioOutputTest {
         output.start(counting)
         web.resumed!!()
         output.stop()
+        assertTrue(!output.isRunning)
+        web.finishFade(events)
 
         assertEquals(AudioOutputEvent.Stopped, events.last())
-        assertEquals(1, web.timersStopped)
+        // The timer that books the buffers, and the fallback of the stop.
+        assertEquals(2, web.timersStopped)
+        assertTrue(web.timers.isEmpty())
         assertEquals(web.gains, web.disconnected)
         assertEquals(1, web.suspends)
         assertTrue(!output.isRunning)
@@ -412,10 +464,7 @@ class WebAudioOutputTest {
     }
 
     /** Hands back the oldest block in flight, as the processor does, with [silence] frames played since the last one. */
-    private fun handBack(silence: Int) {
-        val (slot, block) = web.posted[web.posted.size - WEB_AUDIO_BLOCKS]
-        web.returned!!(slot, silence, block)
-    }
+    private fun handBack(silence: Int) = web.handBackOldest(silence)
 
     @Test
     fun workletSilenceAfterFullRendersIsOneDeviceUnderrunAfterTheNextPost() {
@@ -472,13 +521,13 @@ class WebAudioOutputTest {
                 output.start(counting)
                 web.play()
                 if (technique == BrowserTechnique.Worklet) {
-                    val (slot, block) = web.posted[web.posted.size - WEB_AUDIO_BLOCKS]
-                    web.returned!!(slot, 64, block)
+                    web.handBackOldest(64)
                 } else {
                     web.now += 10 * blockSeconds
                     web.tick!!()
                 }
                 output.stop()
+                web.finishFade(events)
             }
 
             assertEquals(
@@ -542,5 +591,157 @@ class WebAudioOutputTest {
     fun anInvalidBufferSizeIsRefusedBeforeAnythingOpens() {
         assertFailsWith<IllegalArgumentException> { open(bufferFrames = 0) }
         assertTrue(events.isEmpty())
+    }
+
+    private val fade = StopFade(48_000, 2)
+
+    /** The left channel of interleaved stereo samples. */
+    private fun FloatArray.everyOther(): List<Float> = filterIndexed { index, _ -> index % 2 == 0 }
+
+    /** Checks that [left] ramps down from [level] to exactly zero over the fade, then holds zeros, [frames] frames in all. */
+    private fun assertFaded(left: List<Float>, level: Float, frames: Int) {
+        assertEquals(frames, left.size)
+        // A FloatArray rounds to 32 bits as the output's buffers do. On Kotlin/JS a Float product is a double until then.
+        assertEquals(FloatArray(fade.frames) { level * fade.gain(it) }.toList(), left.subList(0, fade.frames))
+        assertEquals(0f, left[fade.frames - 1], "the fade does not end at zero")
+        assertEquals(List(frames - fade.frames) { 0f }, left.subList(fade.frames, frames))
+    }
+
+    private val half = AudioRenderCallback { out, frames ->
+        rendered++
+        out.fill(0.5f, 0, frames * 2)
+        frames
+    }
+
+    @Test
+    fun aWorkletFadeLongerThanABlockSpansBlocksAndCountsNoUnderrun() {
+        val output = open(bufferFrames = 100)
+        output.start(half)
+        web.play()
+        assertEquals(WEB_AUDIO_BLOCKS, rendered)
+
+        output.stop()
+        assertTrue(!output.isRunning)
+        assertEquals(WEB_AUDIO_BLOCKS, rendered, "stop rendered at once")
+        // Each block handed back during the fade asks for the next faded render, with silence that counts nothing.
+        repeat(3) { web.handBackOldest(silence = 50) }
+        assertEquals(WEB_AUDIO_BLOCKS + 3, rendered)
+        val faded = web.postedSamples.takeLast(3).flatMap { it.everyOther() }
+        assertFaded(faded, 0.5f, 300)
+
+        // The blocks before the last faded one come back and render nothing.
+        repeat(WEB_AUDIO_BLOCKS - 1) { web.handBackOldest(silence = 50) }
+        assertEquals(WEB_AUDIO_BLOCKS + 3, rendered)
+        assertTrue(AudioOutputEvent.Stopped !in events, "stopped before the faded block played")
+        web.handBackOldest(silence = 50)
+        assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events.drop(1))
+        assertEquals(1, web.timersStopped, "the fallback timer was not stopped")
+    }
+
+    @Test
+    fun aBuffersFadeIsBookedThenEndsOnceItHasPlayed() {
+        web.now = 10.0
+        val step = 100.0 / 48_000
+        val output = open(bufferFrames = 100, technique = BrowserTechnique.Buffers)
+        output.start(half)
+        web.resumed!!()
+        val booked = web.played.size
+        output.stop()
+        assertTrue(!output.isRunning)
+
+        // A late tick during the fade counts no device underrun.
+        web.now += 10 * step
+        web.tick!!()
+        assertEquals(booked + 3, web.played.size, "the fade was not booked in three blocks")
+        assertFaded(web.playedSamples.takeLast(3).flatMap { it.everyOther() }, 0.5f, 300)
+        val fadeEnd = web.played.last().first + step
+        web.now = fadeEnd - step / 2
+        web.tick!!()
+        assertTrue(AudioOutputEvent.Stopped !in events, "stopped before the faded block played")
+        assertEquals(booked + 3, web.played.size, "silence was booked after the fade")
+        web.now = fadeEnd
+        web.tick!!()
+        assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events.drop(1))
+    }
+
+    @Test
+    fun aSystemEndDuringTheFadeSendsNoDeviceLost() {
+        for (end in listOf<(FakeWebAudio) -> Unit>({ it.stateChanged!!("suspended") }, { it.stateChanged!!("interrupted") }, { it.stateChanged!!("closed") })) {
+            for (technique in listOf(BrowserTechnique.Worklet, BrowserTechnique.Buffers)) {
+                val web = FakeWebAudio()
+                val events = mutableListOf<AudioOutputEvent>()
+                val output = openBrowserOutput(web, format, 256, technique) { events += it }
+                output.start(counting)
+                web.play()
+                output.stop()
+                end(web)
+
+                assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events.drop(1), "$technique")
+                assertTrue(!output.isRunning)
+                output.close()
+            }
+        }
+    }
+
+    @Test
+    fun aCloseDuringTheFadeEndsAtOnce() {
+        val output = open()
+        output.start(counting)
+        web.play()
+        output.stop()
+        output.close()
+
+        assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events.drop(1))
+        assertEquals(web.nodes, web.released)
+        assertEquals(1, web.closes)
+        web.returned!!(0, 0, web.posted[0].second)
+        assertEquals(WEB_AUDIO_BLOCKS, rendered, "a block was rendered after the close")
+    }
+
+    @Test
+    fun theFallbackTimerEndsAFadeThatNeverPlays() {
+        for (technique in listOf(BrowserTechnique.Worklet, BrowserTechnique.Buffers)) {
+            val web = FakeWebAudio()
+            val events = mutableListOf<AudioOutputEvent>()
+            val output = openBrowserOutput(web, format, 256, technique) { events += it }
+            output.start(counting)
+            web.play()
+            output.stop()
+            // Twice the latency of 1504 frames and the fade of 240 frames, plus 100 ms.
+            val (interval, fire) = web.lastTimer!!
+            assertEquals(2 * (1504 + 240) * 1000 / 48_000 + 100, interval, "$technique")
+            assertTrue(AudioOutputEvent.Stopped !in events)
+
+            fire()
+            assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events.drop(1), "$technique")
+            assertTrue(web.timers.isEmpty(), "$technique: a timer still runs")
+            output.start(counting)
+            assertTrue(output.isRunning)
+            output.close()
+        }
+    }
+
+    @Test
+    fun aRenderFailureDuringTheFadeEndsWithFailed() {
+        var fail = false
+        val output = open()
+        output.start { out, frames -> if (fail) error("broken") else { out.fill(0.5f); frames } }
+        web.play()
+        output.stop()
+        fail = true
+        web.handBackOldest()
+
+        assertIs<AudioOutputEvent.Failed>(events[1])
+        assertEquals(AudioOutputEvent.Stopped, events[2])
+        assertEquals(3, events.size)
+    }
+
+    @Test
+    fun aStopBeforeTheStreamStartsEndsAtOnce() {
+        val output = open()
+        output.start(counting)
+        output.stop()
+        assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events)
+        assertTrue(web.timers.isEmpty())
     }
 }

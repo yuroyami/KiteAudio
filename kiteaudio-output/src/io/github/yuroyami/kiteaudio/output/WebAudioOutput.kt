@@ -333,6 +333,10 @@ internal fun <H : Any> openBrowserOutput(
  * Everything here runs on one thread, the page's, so there is nothing to lock. Each start makes a
  * new node, which is what keeps a stopped generation's late messages and scheduled buffers from
  * reaching the next one.
+ *
+ * A stop by the app fades out. The next renders apply the fade, and the generation ends once
+ * the block with the end of the fade has played. After that block the worklet or the gain node
+ * has nothing more to play, so the output plays silence by itself.
  */
 internal class WebAudioOutput<H : Any>(
     override val format: AudioFormat,
@@ -362,6 +366,21 @@ internal class WebAudioOutput<H : Any>(
 
         /** True when a render was short since the worklet last handed a block back. */
         var shortRender = false
+
+        /** True once the app stopped the stream and its sound fades out. */
+        var fading = false
+
+        /** True once the block with the end of the fade is posted or booked. */
+        var fadeDone = false
+
+        /** The worklet slot of the block with the end of the fade. */
+        var fadeEndSlot = -1
+
+        /** The context time at which the booked block with the end of the fade has played. */
+        var fadeEndTime = 0.0
+
+        /** The timer that ends the fade if the browser stops playing. */
+        var fallback: H? = null
         val observer: (AudioOutputEvent) -> Unit = { event ->
             if (event is AudioOutputEvent.Failed) active = false
             deliverAudioEvent(onEvent, event)
@@ -381,6 +400,8 @@ internal class WebAudioOutput<H : Any>(
     private val scratch = FloatArray(bufferFrames * format.channels)
     private val deadlineMicros = format.framesToMicros(bufferFrames)
     private val blockSeconds = bufferFrames.toDouble() / format.sampleRate
+    // Only one generation fades at a time.
+    private val fade = StopFade(format.sampleRate, format.channels)
 
     // Capacity is an estimate of buffering: the blocks in flight and the context's own delay.
     override val latency: Latency
@@ -389,7 +410,7 @@ internal class WebAudioOutput<H : Any>(
             return Latency(bufferFrames * WEB_AUDIO_BLOCKS + (base * format.sampleRate).roundToInt(), LatencyQuality.Estimated)
         }
 
-    override val isRunning: Boolean get() = generation?.active == true
+    override val isRunning: Boolean get() = generation?.let { it.active && !it.fading } == true
 
     // A context at a requested rate hides the rate of the device, so the browser does not say.
     override val deviceFormat: AudioFormat? get() = null
@@ -401,10 +422,11 @@ internal class WebAudioOutput<H : Any>(
         api.onStateChange(context) { state ->
             val current = generation
             if (current != null && !closed) {
+                // A stream in its fade sends no DeviceLost, because the app stopped it.
                 when (state) {
-                    "closed" -> end(current, AudioOutputEvent.DeviceLost("the audio context closed"))
+                    "closed" -> end(current, lost(current, "the audio context closed"))
                     "suspended", "interrupted" ->
-                        if (current.started) end(current, AudioOutputEvent.DeviceLost("the browser $state the audio context"))
+                        if (current.started) end(current, lost(current, "the browser $state the audio context"))
                 }
             }
         }
@@ -416,7 +438,7 @@ internal class WebAudioOutput<H : Any>(
                     generation?.let { current ->
                         if (!closed) {
                             val text = "the audio output device failed: $reason"
-                            end(current, if (current.started) AudioOutputEvent.DeviceLost(text) else AudioOutputEvent.Failed(text))
+                            end(current, if (current.started) lost(current, text) else AudioOutputEvent.Failed(text))
                         }
                     }
                 }
@@ -448,7 +470,7 @@ internal class WebAudioOutput<H : Any>(
     override fun start(callback: AudioRenderCallback) {
         check(!closed) { "the audio output is closed" }
         val previous = generation
-        if (previous?.active == true) {
+        if (previous != null && previous.active && !previous.fading) {
             // A start before the page may play sound leaves resume() waiting, and the browser
             // will not let it finish by itself. A start from the user's click asks again.
             if (!previous.started && previous.node != null) resume(previous)
@@ -518,12 +540,18 @@ internal class WebAudioOutput<H : Any>(
      */
     private fun returned(current: Generation, slot: Int, underrunFrames: Int, block: H) {
         if (!current.active) return
+        // The fade and its play-out count nothing. The generation ends once its last faded block is back.
+        if (current.fading) {
+            if (!current.fadeDone) renderAndPost(current, slot, block)
+            else if (slot == current.fadeEndSlot) end(current, null)
+            return
+        }
         val afterShortRender = current.shortRender
         current.shortRender = false
         if (underrunFrames > 0 && afterShortRender) deliverAudioEvent(onEvent, AudioOutputEvent.Underrun(underrunFrames))
         if (!renderAndPost(current, slot, block)) return
         // A short render already sent Underrun, so its block counts no device underrun.
-        if (underrunFrames > 0 && !afterShortRender && !current.shortRender && current.active) deviceUnderruns.report(1, onEvent)
+        if (underrunFrames > 0 && !afterShortRender && !current.shortRender && current.active && !current.fading) deviceUnderruns.report(1, onEvent)
     }
 
     /**
@@ -534,14 +562,20 @@ internal class WebAudioOutput<H : Any>(
     private fun schedule(current: Generation) {
         if (!current.active) return
         val now = api.currentTime(context)
+        if (current.fadeDone) {
+            // The fade ends once its last booked block has played.
+            if (now >= current.fadeEndTime) end(current, null)
+            return
+        }
         var ranDry = false
         if (current.nextTime < now) {
-            ranDry = true
+            // The fade counts nothing.
+            ranDry = !current.fading
             current.nextTime = now + blockSeconds
         }
         // Half a frame short of the horizon, so a block that would start exactly on it waits for the next tick.
         val horizon = now + blockSeconds * WEB_AUDIO_BLOCKS - 0.5 / format.sampleRate
-        while (current.nextTime < horizon) {
+        while (current.nextTime < horizon && !current.fadeDone) {
             current.shortRender = false
             if (!render(current)) return
             val node = current.node ?: return
@@ -554,10 +588,11 @@ internal class WebAudioOutput<H : Any>(
                 return
             }
             current.nextTime += blockSeconds
+            if (current.fadeDone) current.fadeEndTime = current.nextTime
             if (ranDry) {
                 ranDry = false
                 // A short render already sent Underrun, so its block counts no device underrun.
-                if (!current.shortRender) deviceUnderruns.report(1, onEvent)
+                if (!current.shortRender && !current.fading) deviceUnderruns.report(1, onEvent)
             }
         }
     }
@@ -579,12 +614,17 @@ internal class WebAudioOutput<H : Any>(
             end(current, null)
             return false
         }
+        // A stop by the app, also one from inside this render, fades this block and the next ones out.
+        if (current.fading && fade.apply(scratch, bufferFrames)) current.fadeDone = true
         return true
     }
 
-    /** Renders one block and hands it to the worklet, reusing [recycled] when the processor gave one back. */
+    /**
+     * Renders one block and hands it to the worklet, reusing [recycled] when the processor gave one back.
+     * False when nothing more should be rendered, also after the block with the end of the fade.
+     */
     private fun renderAndPost(current: Generation, slot: Int, recycled: H?): Boolean {
-        if (!render(current)) return false
+        if (current.fadeDone || !render(current)) return false
         val node = current.node ?: return false
         try {
             val block = recycled ?: api.newBlock(scratch.size)
@@ -594,8 +634,16 @@ internal class WebAudioOutput<H : Any>(
             end(current, AudioOutputEvent.Failed("the audio worklet would not take a block", problem))
             return false
         }
+        if (current.fadeDone) {
+            current.fadeEndSlot = slot
+            return false
+        }
         return true
     }
+
+    /** The event for a system end of [current]: DeviceLost, or none during a fade, because the app stopped the stream. */
+    private fun lost(current: Generation, reason: String): AudioOutputEvent? =
+        if (current.fading) null else AudioOutputEvent.DeviceLost(reason)
 
     /**
      * Reports [reason], if any, and ends [current]: the timer stopped, the node released, the
@@ -614,6 +662,8 @@ internal class WebAudioOutput<H : Any>(
         current.ended = true
         current.timer?.let { runCatching { api.stopTimer(it) } }
         current.timer = null
+        current.fallback?.let { runCatching { api.stopTimer(it) } }
+        current.fallback = null
         current.node?.let { runCatching { if (buffers) api.disconnect(it) else api.release(it) } }
         current.node = null
         if (!closed) runCatching { api.suspend(context) }
@@ -625,13 +675,27 @@ internal class WebAudioOutput<H : Any>(
     }
 
     override fun stop() {
-        generation?.let { end(it, null) }
+        val current = generation ?: return
+        // A stream that plays fades out. One that has not started yet has nothing to fade.
+        if (!current.started || !current.active) {
+            end(current, null)
+            return
+        }
+        if (current.fading) return
+        current.fading = true
+        fade.reset()
+        // Twice the latency and the fade, plus 100 ms, for a browser that stops playing.
+        val frames = 2L * (latency.frames + fade.frames)
+        val millis = (frames * 1000 / format.sampleRate + 100).toInt()
+        current.fallback = runCatching {
+            api.startTimer(millis) { end(current, null) }
+        }.getOrNull()
     }
 
     override fun close() {
         if (closed) return
         closed = true
-        stop()
+        generation?.let { end(it, null) }
         runCatching { api.close(context) }
     }
 }

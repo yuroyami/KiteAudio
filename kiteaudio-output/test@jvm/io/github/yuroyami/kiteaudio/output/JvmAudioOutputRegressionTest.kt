@@ -12,6 +12,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /** Deterministic output doubles: these tests never discover or open a physical audio device. */
@@ -40,7 +41,15 @@ class JvmAudioOutputRegressionTest {
                 else -> null
             }
         } as SourceDataLine
-        fun open(observer: (AudioOutputEvent) -> Unit = {}): AudioOutput = JvmAudioOutput(AudioFormat(48_000, ChannelLayout.STEREO), line, 4, observer)
+        fun open(bufferFrames: Int = 4, observer: (AudioOutputEvent) -> Unit = {}): AudioOutput =
+            JvmAudioOutput(AudioFormat(48_000, ChannelLayout.STEREO), line, bufferFrames, observer)
+
+        /** Records every byte that the line takes, and takes all of it at once. */
+        fun record(): MutableList<Byte> {
+            val taken = mutableListOf<Byte>()
+            writer = { data, offset, count -> synchronized(taken) { for (i in offset until offset + count) taken += data[i] }; count }
+            return taken
+        }
     }
 
     private fun await(latch: CountDownLatch) { assertTrue(latch.await(3, TimeUnit.SECONDS), "worker did not reach expected state") }
@@ -100,7 +109,7 @@ class JvmAudioOutputRegressionTest {
     }
 
     @Test
-    fun stopUnblocksAPlatformWriteBeforeWaiting() {
+    fun aStopWhoseWriteNeverReturnsUnblocksItAfterTheBoundedWait() {
         val device = FakeDevice()
         val entered = CountDownLatch(1)
         device.writer = { _, _, _ -> entered.countDown(); await(device.stopped); 0 }
@@ -217,9 +226,10 @@ class JvmAudioOutputRegressionTest {
         val output = device.open()
         val renders = AtomicInteger()
         try {
+            // A close ends at once, with no fade, so the line takes only the first block.
             output.start { out, n ->
                 if (renders.incrementAndGet() == 1) { for (i in out.indices) out[i] = (i + 1) / 16f; n }
-                else { output.stop(); n }
+                else { output.close(); n }
             }
             await(ended)
             output.stop()
@@ -310,11 +320,13 @@ class JvmAudioOutputRegressionTest {
         val output = device.open { relay.target(it) }
         try {
             // Blocks 3 and 4 of each stream find the line empty. Blocks 1 and 2 fill it at the start.
+            // The fade and its play-out also find the line empty, and they count nothing.
             val first = play(device, output, relay, blocks = 4).filter { it.first is AudioOutputEvent.DeviceUnderrun }
+            val before = device.writes.get()
             val second = play(device, output, relay, blocks = 4).filter { it.first is AudioOutputEvent.DeviceUnderrun }
             assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.DeviceUnderrun(1, 1), AudioOutputEvent.DeviceUnderrun(1, 2)), first.map { it.first })
             assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.DeviceUnderrun(1, 3), AudioOutputEvent.DeviceUnderrun(1, 4)), second.map { it.first })
-            assertEquals(listOf(7, 8), second.map { it.second })
+            assertEquals(listOf(before + 3, before + 4), second.map { it.second })
         } finally { output.close() }
     }
 
@@ -324,5 +336,169 @@ class JvmAudioOutputRegressionTest {
         val output = device.open()
         try { assertEquals(Latency(1024, LatencyQuality.Estimated), output.latency) }
         finally { output.close() }
+    }
+
+    private val fade = StopFade(48_000, 2)
+
+    /** The left channel of little-endian 16-bit stereo [bytes]. */
+    private fun leftSamples(bytes: List<Byte>): List<Int> =
+        bytes.chunked(4) { (it[0].toInt() and 0xff) or (it[1].toInt() shl 8) }
+
+    /** The 16-bit value of fade frame [index] for a render of [level]. */
+    private fun faded(level: Float, index: Int): Int = (level * fade.gain(index) * 32767f).toInt()
+
+    /** Waits for [ended], then returns the events, which must end with one Stopped. */
+    private fun stoppedOnce(events: List<AudioOutputEvent>, ended: CountDownLatch): List<AudioOutputEvent> {
+        await(ended)
+        Thread.sleep(20)
+        val seen = synchronized(events) { events.toList() }
+        assertEquals(1, seen.count { it == AudioOutputEvent.Stopped }, "$seen")
+        assertEquals(AudioOutputEvent.Stopped, seen.last(), "$seen")
+        assertTrue(seen.none { it is AudioOutputEvent.DeviceLost || it is AudioOutputEvent.Failed }, "$seen")
+        return seen
+    }
+
+    @Test
+    fun aStopFromTheRendererFadesAcrossBlocksThenPlaysOutSilence() {
+        val device = FakeDevice()
+        val taken = device.record()
+        val events = mutableListOf<AudioOutputEvent>()
+        val ended = CountDownLatch(1)
+        val renders = AtomicInteger()
+        val runningAfterStop = AtomicReference<Boolean?>()
+        val restart = AtomicReference<Throwable?>()
+        lateinit var output: AudioOutput
+        output = device.open(bufferFrames = 100) {
+            synchronized(events) { events += it }
+            if (it == AudioOutputEvent.Stopped) ended.countDown()
+        }
+        try {
+            output.start { out, frames ->
+                out.fill(0.5f)
+                if (renders.incrementAndGet() == 3) {
+                    output.stop()
+                    runningAfterStop.set(output.isRunning)
+                    restart.set(runCatching { output.start { _, n -> n } }.exceptionOrNull())
+                }
+                frames
+            }
+            stoppedOnce(events, ended)
+            assertEquals(false, runningAfterStop.get(), "isRunning was true after stop returned")
+            assertIs<IllegalStateException>(restart.get(), "a start during the fade was not rejected")
+            // 240 frames of fade span blocks 3, 4 and 5, and the callback is called for each of them.
+            assertEquals(240, fade.frames)
+            assertEquals(5, renders.get())
+            val left = leftSamples(synchronized(taken) { taken.toList() })
+            val full = (0.5f * 32767f).toInt()
+            assertEquals(List(200) { full }, left.subList(0, 200))
+            assertEquals(List(240) { faded(0.5f, it) }, left.subList(200, 440))
+            assertEquals(0, left[439], "the fade does not end at zero")
+            // The rest of block 5, then silence for the whole line: 1024 frames in blocks of 100.
+            assertEquals(List(60 + 1100) { 0 }, left.subList(440, left.size))
+        } finally { output.close() }
+    }
+
+    @Test
+    fun aStopFromAnotherThreadFadesOutBeforeItReturns() {
+        val device = FakeDevice()
+        val taken = device.record()
+        val events = mutableListOf<AudioOutputEvent>()
+        val ended = CountDownLatch(1)
+        val three = CountDownLatch(3)
+        val output = device.open(bufferFrames = 100) {
+            synchronized(events) { events += it }
+            if (it == AudioOutputEvent.Stopped) ended.countDown()
+        }
+        try {
+            output.start { out, frames -> out.fill(0.5f); three.countDown(); frames }
+            await(three)
+            output.stop()
+            assertFalse(output.isRunning)
+            stoppedOnce(events, ended)
+            val left = leftSamples(synchronized(taken) { taken.toList() })
+            val full = (0.5f * 32767f).toInt()
+            val fadeStart = left.indexOfFirst { it != full }
+            assertTrue(fadeStart > 0 && fadeStart % 100 == 0, "the fade does not start on a block: $fadeStart")
+            assertEquals(List(240) { faded(0.5f, it) }, left.subList(fadeStart, fadeStart + 240))
+            assertEquals(List(left.size - fadeStart - 240) { 0 }, left.subList(fadeStart + 240, left.size))
+            assertTrue(left.size - fadeStart - 240 >= 1024, "the play-out is shorter than the line")
+        } finally { output.close() }
+    }
+
+    @Test
+    fun aWriteFailureDuringTheFadeSendsNoDeviceLost() {
+        for (result in listOf(-1, 0)) {
+            val device = FakeDevice()
+            val fading = AtomicReference(false)
+            device.writer = { _, _, count -> if (fading.get()) result else count }
+            val events = mutableListOf<AudioOutputEvent>()
+            val ended = CountDownLatch(1)
+            val renders = AtomicInteger()
+            lateinit var output: AudioOutput
+            output = device.open(bufferFrames = 100) {
+                synchronized(events) { events += it }
+                if (it == AudioOutputEvent.Stopped) ended.countDown()
+            }
+            try {
+                output.start { _, frames ->
+                    if (renders.incrementAndGet() == 3) { fading.set(true); output.stop() }
+                    frames
+                }
+                stoppedOnce(events, ended)
+                assertEquals(3, renders.get(), "result $result")
+            } finally { output.close() }
+        }
+    }
+
+    @Test
+    fun aCloseDuringTheFadeEndsAtOnce() {
+        val device = FakeDevice()
+        val taken = device.record()
+        val events = mutableListOf<AudioOutputEvent>()
+        val ended = CountDownLatch(1)
+        val renders = AtomicInteger()
+        lateinit var output: AudioOutput
+        output = device.open(bufferFrames = 100) {
+            synchronized(events) { events += it }
+            if (it == AudioOutputEvent.Stopped) ended.countDown()
+        }
+        output.start { out, frames ->
+            out.fill(0.5f)
+            when (renders.incrementAndGet()) {
+                3 -> output.stop()
+                4 -> output.close()
+            }
+            frames
+        }
+        stoppedOnce(events, ended)
+        assertEquals(4, renders.get())
+        // Blocks 1 to 3, and no faded block 4 and no silence after the close.
+        assertEquals(300 * 4, synchronized(taken) { taken.size })
+        assertFailsWith<IllegalStateException> { output.start { _, n -> n } }
+    }
+
+    @Test
+    fun aLineThatStopsTakingSoundDuringTheFadeHaltsAfterTheBoundedWait() {
+        val device = FakeDevice()
+        val stall = AtomicReference(false)
+        device.writer = { _, _, count -> if (stall.get()) { await(device.stopped); 0 } else { Thread.sleep(1); count } }
+        val events = mutableListOf<AudioOutputEvent>()
+        val ended = CountDownLatch(1)
+        val three = CountDownLatch(3)
+        val output = device.open(bufferFrames = 100) {
+            synchronized(events) { events += it }
+            if (it == AudioOutputEvent.Stopped) ended.countDown()
+        }
+        try {
+            output.start { _, frames -> three.countDown(); frames }
+            await(three)
+            stall.set(true)
+            val before = System.nanoTime()
+            output.stop()
+            val waitedMillis = (System.nanoTime() - before) / 1_000_000
+            assertFalse(output.isRunning)
+            assertTrue(waitedMillis in 450..2_000, "stop waited $waitedMillis ms")
+            stoppedOnce(events, ended)
+        } finally { output.close() }
     }
 }

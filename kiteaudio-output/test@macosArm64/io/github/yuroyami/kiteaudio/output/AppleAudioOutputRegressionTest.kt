@@ -8,9 +8,11 @@ import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.CPointerVar
+import kotlinx.cinterop.ShortVar
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.free
+import kotlinx.cinterop.get
 import kotlinx.cinterop.invoke
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.nativeHeap
@@ -40,6 +42,7 @@ import platform.darwin.dispatch_queue_create
 import platform.darwin.dispatch_queue_t
 import platform.darwin.dispatch_sync
 import platform.posix.usleep
+import kotlin.time.TimeSource
 
 /** Native allocation/dispatch is real; every AudioQueue operation is a fake with no hardware. */
 class AppleAudioOutputRegressionTest {
@@ -96,6 +99,8 @@ class AppleAudioOutputRegressionTest {
         }
         /** Runs once inside the next enqueue, which then refuses the buffer as a stopped queue does. */
         var enqueueHook: (() -> Unit)? = null
+        /** The samples of every accepted buffer, in the order of the enqueues. */
+        val enqueued = AtomicReference<List<List<Short>>>(emptyList())
         override fun enqueue(queue: AudioQueueRef, buffer: AudioQueueBufferRef): Int {
             if (disposed.load()) { lifetimeViolation.store(true); return -1 }
             enqueueHook?.let { hook ->
@@ -104,7 +109,11 @@ class AppleAudioOutputRegressionTest {
                 return KAUDIO_QUEUE_ERR_ENQUEUE_DURING_RESET
             }
             enqueues.fetchAndAdd(1)
-            return if (rejectEnqueue.load()) -1 else 0
+            if (rejectEnqueue.load()) return -1
+            val data = buffer.pointed.mAudioData!!.reinterpret<ShortVar>()
+            val samples = List((buffer.pointed.mAudioDataByteSize / 2u).toInt()) { data[it] }
+            enqueued.store(enqueued.load() + listOf(samples))
+            return 0
         }
         // Like AudioQueue, a start and a stop each report the new running state to the listener.
         override fun start(queue: AudioQueueRef): Int { starts.fetchAndAdd(1); running.store(true); postRunningChange(); return 0 }
@@ -375,10 +384,12 @@ class AppleAudioOutputRegressionTest {
             assertFalse(driver.disposed.load())
         } finally {
             released.store(true)
+            driver.flushCallbacks()
             output.close()
         }
         await { driver.disposed.load() }
-        assertEquals(3, driver.enqueues.load())
+        // The block that was rendering when stop came is the first block of the fade.
+        assertEquals(4, driver.enqueues.load())
     }
     /** Checks the end of a stream the system stopped: one DeviceLost, then one Stopped, and nothing after. */
     private fun assertOneLossThenStopped(events: Events, reason: String) {
@@ -805,5 +816,140 @@ class AppleAudioOutputRegressionTest {
         assertOneLossThenStopped(events, "the system stopped the audio queue")
         assertTrue(driver.disposed.load())
         assertFailsWith<IllegalStateException> { output.start { _, frames -> frames } }
+    }
+
+    private val fade = StopFade(48_000, 2)
+
+    /** The left channel of the enqueued buffers from [from] on, as one list. */
+    private fun left(driver: Driver, from: Int, count: Int): List<Int> =
+        driver.enqueued.load().subList(from, from + count).flatten().filterIndexed { i, _ -> i % 2 == 0 }.map { it.toInt() }
+
+    /** Fires [count] callbacks, one after the other. */
+    private fun fire(driver: Driver, count: Int) = repeat(count) { driver.fireAsync(); driver.flushCallbacks() }
+
+    @Test
+    fun aStopFromTheRendererFadesAcrossBuffersThenEnqueuesSilenceUntilTheFadedBufferIsBack() {
+        val driver = Driver()
+        val events = Events()
+        val renders = AtomicInt(0)
+        val runningAfterStop = AtomicReference<Boolean?>(null)
+        val restart = AtomicReference<Throwable?>(null)
+        lateinit var output: AppleAudioOutput
+        output = AppleAudioOutput(stereo, 100, events::add, driver)
+        try {
+            output.start { out, frames ->
+                out.fill(0.5f)
+                if (renders.addAndFetch(1) == 5) {
+                    output.stop()
+                    runningAfterStop.store(output.isRunning)
+                    restart.store(runCatching { output.start { _, n -> n } }.exceptionOrNull())
+                }
+                frames
+            }
+            settle(output, driver)
+            val clockReads = driver.clockReads.load()
+            // Render 4 plays, render 5 stops, and renders 5 to 7 hold the 240 frames of the fade.
+            fire(driver, 4)
+            assertEquals(false, runningAfterStop.load(), "isRunning was true after stop returned")
+            assertIs<IllegalStateException>(restart.load(), "a start during the fade was not rejected")
+            assertEquals(7, renders.load())
+            assertEquals(clockReads + 1, driver.clockReads.load(), "the fade read the queue clock")
+            val full = (0.5f * 32767f).toInt()
+            assertEquals(List(100) { full }, left(driver, 3, 1))
+            val faded = left(driver, 4, 3)
+            assertEquals(List(240) { (0.5f * fade.gain(it) * 32767f).toInt() }, faded.subList(0, 240))
+            assertEquals(0, faded[239], "the fade does not end at zero")
+            assertEquals(List(60) { 0 }, faded.subList(240, 300))
+
+            // The next two callbacks enqueue silence. The third hands back the buffer with the end of the fade.
+            fire(driver, 2)
+            settle(output, driver)
+            assertEquals(0, events.stops, "stopped before the faded buffer played: ${events.all}")
+            assertEquals(List(200) { 0 }, left(driver, 7, 2))
+            fire(driver, 1)
+            await { events.stops == 1 }
+            settle(output, driver)
+            assertEquals(9, driver.enqueues.load())
+            assertEquals(7, renders.load())
+            assertTrue(driver.disposed.load())
+            assertEquals(AudioOutputEvent.Stopped, events.all.last())
+            assertTrue(events.all.none { it is AudioOutputEvent.Failed || it is AudioOutputEvent.DeviceLost }, "${events.all}")
+        } finally { output.close() }
+    }
+
+    @Test
+    fun aSystemEndDuringTheFadeSendsNoDeviceLost() {
+        val ends = listOf<Pair<String, (Driver, AppleAudioOutput) -> Unit>>(
+            "queue stop" to { driver, _ -> driver.stopRunning() },
+            "refused buffer" to { driver, _ -> driver.stopRunningAndReturnABuffer() },
+        ) + SessionNotice.entries.map { notice -> notice.name to { _: Driver, output: AppleAudioOutput -> output.onSessionNotice(notice) } }
+        for ((name, end) in ends) {
+            val driver = Driver()
+            val events = Events()
+            val output = AppleAudioOutput(stereo, 4, events::add, driver)
+            try {
+                output.start { _, frames -> frames }
+                settle(output, driver)
+                output.stop()
+                end(driver, output)
+                await { events.stops == 1 }
+                settle(output, driver)
+                // The fallback of the stop finds nothing left to release.
+                usleep(150_000u)
+                settle(output, driver)
+                assertTrue(events.losses.isEmpty(), "$name: ${events.all}")
+                assertTrue(events.all.none { it is AudioOutputEvent.Failed }, "$name: ${events.all}")
+                assertEquals(1, events.stops, "$name: ${events.all}")
+                assertFalse(output.isRunning)
+                assertTrue(driver.disposed.load(), name)
+            } finally { output.close() }
+        }
+    }
+
+    @Test
+    fun aCloseDuringTheFadeEndsAtOnce() {
+        val driver = Driver()
+        val events = Events()
+        val renders = AtomicInt(0)
+        val output = AppleAudioOutput(stereo, 4, events::add, driver)
+        output.start { _, frames -> renders.fetchAndAdd(1); frames }
+        settle(output, driver)
+        output.stop()
+        fire(driver, 1)
+        val before = TimeSource.Monotonic.markNow()
+        output.close()
+        settle(output, driver)
+        assertEquals(1, events.stops, "${events.all}")
+        assertTrue(before.elapsedNow().inWholeMilliseconds < 100, "close waited for the fallback")
+        assertTrue(driver.disposed.load())
+        assertEquals(4, renders.load())
+        assertFailsWith<IllegalStateException> { output.start { _, frames -> frames } }
+    }
+
+    @Test
+    fun theFallbackReleasesAFadeWhoseQueueStopsAskingForBuffers() {
+        val driver = Driver()
+        val events = Events()
+        // A latency of 3 buffers of 100 frames and a fade of 240 frames give a wait of 122.5 ms.
+        val output = AppleAudioOutput(stereo, 100, events::add, driver)
+        try {
+            output.start { _, frames -> frames }
+            settle(output, driver)
+            val before = TimeSource.Monotonic.markNow()
+            output.stop()
+            assertFalse(output.isRunning)
+            usleep(60_000u)
+            settle(output, driver)
+            assertEquals(0, events.stops, "released before the fallback: ${events.all}")
+            await { events.stops == 1 }
+            val waited = before.elapsedNow().inWholeMilliseconds
+            assertTrue(waited in 110..2_000, "the fallback came after $waited ms")
+            settle(output, driver)
+            assertTrue(driver.disposed.load())
+            assertEquals(listOf<AudioOutputEvent>(AudioOutputEvent.Stopped), events.all.filter { it !is AudioOutputEvent.Started })
+            // Restart works once the generation has unwound.
+            output.start { _, frames -> frames }
+            assertTrue(output.isRunning)
+        } finally { output.close() }
     }
 }

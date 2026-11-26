@@ -118,7 +118,7 @@ fun startTone(): AudioOutput {
 
 val output = startTone()
 // Later, from the application's control/lifecycle thread:
-output.stop()
+output.stop()   // fades out. A close() before Stopped arrives ends the fade early.
 output.close()
 ```
 
@@ -273,12 +273,21 @@ need an explicit handoff.
   flight either way, as on the JVM.
 - Event handlers must be fast. Transfer UI work to the UI thread outside the callback.
   `stop()` and `close()` are safe from a render or event callback; they never wait for themselves.
-- `stop()` cancels the current generation. JVM/Android unblock output and wait up to 500 ms;
-  Apple schedules teardown; the browser stops at once, or when the current render returns.
-  In-progress work may finish after return. Restart is rejected until
+- `stop()` fades the sound out, then ends the current generation. `isRunning` is false when
+  `stop()` returns. The render callback is still called for the blocks of the fade. The fade
+  multiplies the sound by a gain that falls from 1 to 0 over 5 ms. The output then plays out
+  the sound that is still queued, halts and sends `Stopped` once. A stream that has not
+  started yet ends at once.
+- The fade is bounded. JVM and Android wait up to 500 ms for it, then halt at once. Apple and
+  the browser halt at once when the device stops asking for sound, after about twice the
+  latency plus 100 ms. A system end during the fade sends no `DeviceLost`. A render failure
+  during the fade ends it at once with `Failed`.
+- In-progress work may finish after `stop()` returns. Restart is rejected until the fade,
   rendering and terminal event delivery have unwound, including the `Stopped` observer itself.
-- `close()` makes the output permanently closed and releases platform output. Always call it,
-  including after startup failure. A failed native disposal retains callback ownership and
+- `close()` makes the output permanently closed and releases platform output at once, with no
+  fade. A `close()` during the fade of a `stop()` also ends it at once. To keep the fade,
+  call `close()` after `Stopped` arrives. On the JVM and Android, `stop()` usually returns
+  after `Stopped`. Always call `close()`, including after startup failure. A failed native disposal retains callback ownership and
   blocks restart; a later `stop()` or `close()` retries disposal.
 - Use a positive, modest `bufferFrames` value. Bounds and multiplication are validated before
   allocation; return a frame count in `0..frames`. Partial writes are completed before the

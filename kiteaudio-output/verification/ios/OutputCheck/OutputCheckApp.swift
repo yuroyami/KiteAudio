@@ -163,20 +163,26 @@ private func routeChangeReason(_ raw: UInt) -> String {
     }
 }
 
-/// A quiet 440 Hz tone. The output calls it on its own serial render queue.
+/// A quiet 440 Hz tone that fades in over 5 ms. The output calls it on its own serial render queue.
 final class ToneRenderer: NSObject, AudioRenderCallback {
     private let channels: Int32
     private let step: Double
+    private let fadeInFrames: Double
     private var phase = 0.0
+    private var rendered = 0.0
 
     init(channels: Int32, sampleRate: Double) {
         self.channels = channels
         self.step = 2 * Double.pi * 440 / sampleRate
+        self.fadeInFrames = sampleRate * 0.005
     }
 
     func render(out: KotlinFloatArray, frames: Int32) -> Int32 {
         for frame in 0..<frames {
-            let value = Float(sin(phase) * 0.03)
+            // A tone that starts at full volume clicks, so the app fades it in.
+            let gain = min(1.0, rendered / fadeInFrames)
+            rendered += 1
+            let value = Float(sin(phase) * 0.03 * gain)
             for channel in 0..<channels {
                 out.set(index: frame * channels + channel, value: value)
             }

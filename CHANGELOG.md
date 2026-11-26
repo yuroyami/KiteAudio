@@ -153,6 +153,8 @@ The artifacts and packages have new names:
   On Android, `audioOutputDevices(context)` lists the devices of `AudioManager`.
 - On the JVM, `audioOutputAvailable()` is true when any mixer offers an output line for signed 16-bit PCM.
   Before, it checked one fixed format.
+- `AudioOutput.stop()` fades the sound out over 5 ms and plays out the queued sound before it halts, so a stop
+  no longer clicks. `close()` still ends at once.
 
 ### Added in the synth module
 
