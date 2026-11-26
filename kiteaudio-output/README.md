@@ -37,22 +37,11 @@ with [`kiteaudio-synth`](../kiteaudio-synth/README.md) to generate sound,
 to decode audio files.
 
 > [!NOTE]
-> The version is `0.3.0`. The API can still change. 0.3.0 is not published to Maven Central yet,
-> so build it from a source checkout.
+> The version is `0.3.0`. The API can still change.
 
-## Install from source
+## Install
 
-`kiteaudio-output` builds with the [Kotlin Toolchain](https://github.com/JetBrains/kotlin-toolchain), the
-`./kotlin` script in the repository root. Clone this repository, then publish it to your local
-Maven repository:
-
-```sh
-./kotlin publish mavenLocal -m kiteaudio-output
-```
-
-The publish signs the artifacts, so it needs a signing key in the `KOTLIN_TOOLCHAIN_SIGNING_KEY`
-and `KOTLIN_TOOLCHAIN_SIGNING_KEY_PASSPHRASE` environment variables. Add `mavenLocal()` to the
-repositories of your application, then add the dependency in a Kotlin Multiplatform application:
+`kiteaudio-output` is on Maven Central. Add the dependency in a Kotlin Multiplatform application:
 
 ```kotlin
 kotlin {

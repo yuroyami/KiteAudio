@@ -49,7 +49,7 @@ the codec's own reference decoder.
 
 ## Install
 
-0.3.0 is not published to Maven Central yet. These are the coordinates it will use:
+0.3.0 is on Maven Central. Add the artifacts you need:
 
 With Gradle:
 

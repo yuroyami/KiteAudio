@@ -6,7 +6,7 @@ without touching the audio. The same code runs on every target.
 
 ## Install
 
-0.3.0 is not published to Maven Central yet. These are the coordinates it will use:
+0.3.0 is on Maven Central. Add the artifacts you need:
 
 ```kotlin
 dependencies {

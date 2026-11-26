@@ -83,11 +83,7 @@ device. Playback scheduling and Compose UI belong to the application.
 
 ## Install
 
-0.3.0 is not published to Maven Central yet. Until then, publish the modules to your local
-Maven repository, as [Build and test](#build-and-test) shows. Then add `mavenLocal()` to the
-repositories of your application.
-
-Add the modules you need:
+0.3.0 is on Maven Central. Add the modules you need:
 
 ```kotlin
 kotlin {

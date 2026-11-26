@@ -47,20 +47,11 @@ and prepares its regions; a callback should reuse that synth and its output buff
 
 > [!NOTE]
 > The version is `0.3.0`. The API can still change, and [CHANGELOG.md](../CHANGELOG.md) lists the
-> breaking changes. 0.3.0 is not published to Maven Central yet.
+> breaking changes.
 
-## Install from source
+## Install
 
-`kiteaudio-synth` builds with the [Kotlin Toolchain](https://github.com/JetBrains/kotlin-toolchain), the
-`./kotlin` script in the repository root. Publish the checkout to your local Maven repository:
-
-```sh
-./kotlin publish mavenLocal -m kiteaudio-synth
-```
-
-The publish signs the artifacts, so it needs a signing key in the `KOTLIN_TOOLCHAIN_SIGNING_KEY`
-and `KOTLIN_TOOLCHAIN_SIGNING_KEY_PASSPHRASE` environment variables. Add `mavenLocal()` to the
-repositories of the consuming project, then add the dependency to your shared code:
+`kiteaudio-synth` is on Maven Central. Add the dependency to your shared code:
 
 ```kotlin
 kotlin {
