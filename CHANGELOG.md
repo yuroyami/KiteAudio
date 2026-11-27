@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - 2026-11-26
+## 0.3.0 - 2026-11-27
 
 The first release of KiteAudio. KiteAudio holds the codec, MIDI, synth and output
 libraries in one repository. Each library is its own artifact, and all eight artifacts
