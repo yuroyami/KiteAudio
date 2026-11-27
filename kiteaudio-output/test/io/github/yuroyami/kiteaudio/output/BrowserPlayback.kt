@@ -2,6 +2,9 @@ package io.github.yuroyami.kiteaudio.output
 
 import io.github.yuroyami.kiteaudio.core.AudioFormat
 import io.github.yuroyami.kiteaudio.core.ChannelLayout
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.startCoroutine
 import kotlin.math.PI
 import kotlin.math.sin
 
@@ -11,8 +14,10 @@ import kotlin.math.sin
  * underrun, overrun and failure. The tone stops itself from inside the renderer, which is the path a stop from the
  * renderer takes. Not a test: the web test modules export it for kiteaudio-output/verification/web,
  * which runs it in a browser. Run from a click it plays at once. Run before one, it waits, and the
- * function it returns starts the output again, which is what a click handler would do. That
- * function does nothing once the check has finished, and says so through [report].
+ * function it returns starts the output again, which is what a click handler would do. An output
+ * that lost its device stays open after its report, so that function can start it once more and
+ * show what a start after the loss does. Otherwise that function does nothing once the check has
+ * finished, and says so through [report].
  */
 internal fun browserPlaybackCheck(
     seconds: Int,
@@ -30,6 +35,8 @@ internal fun browserPlaybackCheck(
     var worstOverrunMicros = 0L
     val notes = mutableListOf<String>()
     var finished = false
+    var lost = false
+    var startedAfterLoss = false
     lateinit var output: AudioOutput
     output = open(format, 512) { event ->
         when (event) {
@@ -38,10 +45,15 @@ internal fun browserPlaybackCheck(
             is AudioOutputEvent.DeviceUnderrun -> deviceUnderruns = event.total
             is AudioOutputEvent.Overrun -> { overruns++; if (event.tookMicros > worstOverrunMicros) worstOverrunMicros = event.tookMicros }
             is AudioOutputEvent.Failed -> notes += "failed: ${event.reason} ${event.cause ?: ""}"
-            is AudioOutputEvent.DeviceLost -> notes += "device lost: ${event.reason}"
+            is AudioOutputEvent.DeviceLost -> { lost = true; notes += "device lost: ${event.reason}" }
             AudioOutputEvent.Stopped -> {
-                finished = true
-                output.close()
+                val keepOpen = lost && !startedAfterLoss
+                if (keepOpen) {
+                    notes += "the output stays open: start it again to see what a start after the loss does"
+                } else {
+                    finished = true
+                    output.close()
+                }
                 report(
                     (notes + listOf(
                         "rendered $blocks blocks, ${played * 1000 / format.sampleRate} ms of audio",
@@ -51,6 +63,7 @@ internal fun browserPlaybackCheck(
                         "stopped",
                     )).joinToString("\n"),
                 )
+                notes.clear()
             }
         }
     }
@@ -66,5 +79,51 @@ internal fun browserPlaybackCheck(
         frames
     }
     output.start(tone)
-    return { if (finished) report("already finished: the first start played without waiting for a click") else output.start(tone) }
+    return {
+        when {
+            finished -> report("already finished: the output is closed")
+            else -> {
+                if (lost) startedAfterLoss = true
+                output.start(tone)
+            }
+        }
+    }
+}
+
+/**
+ * Lists the outputs through [devices] and reports them to [report] as a JSON array of objects with
+ * `id`, `name` and `isDefault`, or as a JSON object with `error` when the listing fails. Not a
+ * test: the web test modules export it for kiteaudio-output/verification/web.
+ */
+internal fun <H : Any> browserDeviceList(devices: BrowserOutputDevices<H>, report: (String) -> Unit) {
+    suspend { devices.list() }.startCoroutine(
+        Continuation(EmptyCoroutineContext) { result ->
+            report(
+                result.fold(
+                    { list -> list.joinToString(",", "[", "]") { "{\"id\":${jsonString(it.id)},\"name\":${jsonString(it.name)},\"isDefault\":${it.isDefault}}" } },
+                    { problem -> "{\"error\":${jsonString(problem.toString())}}" },
+                ),
+            )
+        },
+    )
+}
+
+/**
+ * The device with [id] in the last listing of [devices], or null for an empty [id]. An id that the
+ * listing did not hold comes back as a device of its own, so the output can refuse it.
+ */
+internal fun <H : Any> browserChosenDevice(devices: BrowserOutputDevices<H>, id: String): AudioOutputDevice? =
+    if (id.isEmpty()) null else devices.find(id) ?: AudioOutputDevice(id, "", false, emptyList(), emptyList())
+
+private fun jsonString(text: String): String = buildString {
+    append('"')
+    for (c in text) {
+        when (c) {
+            '"' -> append("\\\"")
+            '\\' -> append("\\\\")
+            '\n' -> append("\\n")
+            else -> if (c < ' ') append("\\u" + c.code.toString(16).padStart(4, '0')) else append(c)
+        }
+    }
+    append('"')
 }

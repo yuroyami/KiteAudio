@@ -14,12 +14,23 @@
   <h1>KiteAudio web verification</h1>
   <p>Serve the repository root over HTTP and open this page from localhost, which counts as a secure context. Each playback button plays a quiet 440 Hz tone for three seconds, by the technique chosen.</p>
   <p>Open the page as <code>index.html?early=js</code> or <code>?early=wasmJs</code>, with <code>&amp;mode=Buffers</code> if you like, to start an output before any click. The Play button for that platform then starts the same output again, as a click handler would.</p>
-  <p><label>Technique <select id="mode"><option>Auto</option><option>Worklet</option><option>Buffers</option></select></label></p>
+  <p>To play on another output, press List outputs, then choose one. The names stay empty until the page has a media permission, which Ask for permission requests through the microphone; list again after granting it. Choose a longer run to unplug the output while it plays, then press Start again to see what a start after the loss does.</p>
+  <p>
+    <label>Technique <select id="mode"><option>Auto</option><option>Worklet</option><option>Buffers</option></select></label>
+    <label>Seconds <select id="seconds"><option>3</option><option>30</option></select></label>
+  </p>
+  <p><label>Output <select id="device"><option value="">Default, with no device</option></select></label></p>
+  <p>
+    <button id="list">List outputs</button>
+    <button id="permission">Ask for permission</button>
+    <label>Id by hand <input id="manual" size="20" placeholder="an id not listed"></label>
+  </p>
   <button data-platform="js">Play, JS</button>
   <button data-platform="wasmJs">Play, wasmJs</button>
+  <button id="again">Start again</button>
   <pre id="log"></pre>
   <script type="module">
-    import { playbackCheck } from "./modules.mjs";
+    import { playbackCheck, listDevices } from "./modules.mjs";
     const root = new URL("../../../", import.meta.url);
     const log = document.getElementById("log");
     const write = (text) => { log.textContent += text + "\n\n"; console.log(text); };
@@ -33,14 +44,43 @@
       try {
         const { check, again } = await playbackCheck(early, root);
         globalThis.kiteAudioOutputReport = (text) => write(`Playback, ${early}, ${mode}, started before a click\n${text}`);
-        check(3, mode);
+        check(3, mode, "");
         waiting = again;
         write(`${early}: started before a click; press Play, ${early} to start it again`);
       } catch (problem) {
         write(`${early}: ${problem.stack ?? problem}`);
       }
     }
-    for (const button of document.querySelectorAll("button")) {
+    let last = null;
+    const chosen = () => document.getElementById("manual").value.trim() || document.getElementById("device").value;
+    document.getElementById("list").addEventListener("click", async () => {
+      const select = document.getElementById("device");
+      const keep = select.value;
+      try {
+        // Each platform keeps its own listing, so both list; the ids are the browser's, so they agree.
+        const outputs = await listDevices("js", root);
+        await listDevices("wasmJs", root);
+        select.length = 1;
+        for (const output of outputs) select.add(new Option(`${output.name || "(no name)"}${output.isDefault ? ", default" : ""}: ${output.id}`, output.id));
+        if ([...select.options].some((option) => option.value === keep)) select.value = keep;
+        write(`listed ${outputs.length} outputs:\n` + outputs.map((o) => `${o.isDefault ? "default " : ""}${o.id} ${JSON.stringify(o.name)}`).join("\n"));
+      } catch (problem) {
+        write(`listing: ${problem.stack ?? problem}`);
+      }
+    });
+    document.getElementById("permission").addEventListener("click", async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        for (const track of stream.getTracks()) track.stop();
+        write("permission granted; list the outputs again for their names");
+      } catch (problem) {
+        write(`permission: ${problem}`);
+      }
+    });
+    document.getElementById("again").addEventListener("click", () => {
+      if (last) last(); else write("nothing to start again");
+    });
+    for (const button of document.querySelectorAll("button[data-platform]")) {
       button.addEventListener("click", async () => {
         const platform = button.dataset.platform;
         try {
@@ -50,12 +90,16 @@
             again();
             return;
           }
-          const { check } = await playbackCheck(platform, root);
+          const { check, again } = await playbackCheck(platform, root);
           const mode = document.getElementById("mode").value;
-          globalThis.kiteAudioOutputReport = (text) => write(`Playback, ${platform}, ${mode}\n${text}`);
-          check(3, mode);
+          const seconds = Number(document.getElementById("seconds").value);
+          const device = chosen();
+          const label = `Playback, ${platform}, ${mode}, ${device ? `output ${device}` : "default output"}`;
+          globalThis.kiteAudioOutputReport = (text) => write(`${label}\n${text}`);
+          last = again;
+          check(seconds, mode, device);
         } catch (problem) {
-          write(`${platform}: ${problem.stack ?? problem}`);
+          write(`${platform}: ${problem.message ?? problem}`);
         }
       });
     }

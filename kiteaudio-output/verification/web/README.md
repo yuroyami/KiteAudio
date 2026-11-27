@@ -25,4 +25,10 @@ The Play buttons are clicks, so the browser lets them play at once. To check a s
 
 To see the fallback to buffers, open the page from another machine on the network over plain HTTP, which is not a secure context, and play with Auto. For a hidden tab, switch away during a run. Browsers slow page timers in a hidden tab, so a Buffers run is expected to report device underruns there and a Worklet run none, but neither has been checked yet.
 
-`globalThis.kiteAudioOutputReport` receives the playback report, so the page can be driven from a browser's own automation as well.
+## Choosing an output
+
+List outputs fills the Output menu from `enumerateDevices()`, through each platform's own listing, as an app would through `audioOutputDevices()`. The names stay empty until the page has a media permission; Ask for permission requests one through the microphone, and the page releases the microphone at once. List again after granting it. Each Play button then opens on the chosen output. Id by hand passes an id that no listing holds, which the output should refuse with `IllegalArgumentException`.
+
+A browser whose `AudioContext` takes a `sinkId`, which is Chromium 110 and newer, should play on the chosen output. Any other browser should refuse a non-default entry with `UnsupportedOperationException`. To check a lost device, connect a second output, choose it, play for 30 seconds and unplug it during the run. Chromium 128 and newer should report `DeviceLost`, and the output stays open, so Start again then starts it once more, which should report `Failed`.
+
+`globalThis.kiteAudioOutputReport` receives the playback report, and `globalThis.kiteAudioOutputDevicesListed` the listing as JSON, so the page can be driven from a browser's own automation as well.
